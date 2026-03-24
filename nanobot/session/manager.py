@@ -169,7 +169,7 @@ class SessionManager:
         return session
 
     def _load(self, key: str) -> Session | None:
-        """Load a session from disk."""
+        """Load a session from disk, recovering partial data from corrupt files."""
         path = self._get_session_path(key)
         if not path.exists():
             legacy_path = self._get_legacy_session_path(key)
@@ -184,35 +184,140 @@ class SessionManager:
             return None
 
         try:
-            messages = []
-            metadata = {}
-            created_at = None
-            last_consolidated = 0
+            messages: list[dict[str, Any]] = []
+            metadata: dict[str, Any] = {}
+            created_at: datetime | None = None
+            last_consolidated: int = 0
+            last_consolidated_untrustworthy = False
+            metadata_parsed = False
+            recovered = False
+            skipped_count = 0
+            total_lines = 0
 
-            with open(path, encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
+            # Position-aware index-shift tracking:
+            # If a corrupt line is skipped BEFORE the known consolidation boundary,
+            # subsequent messages shift to lower indices, making the boundary unreliable.
+            # Known limitation: if metadata appears after messages (non-standard format
+            # not produced by save()), pre-metadata skips won't be caught here.
+            # The fallback via `not metadata_parsed` still covers that extreme case.
+            msg_index = 0
+            skipped_before_boundary = False
+
+            with open(path, encoding="utf-8-sig") as f:
+                for line_num, raw in enumerate(f, 1):
+                    stripped = raw.strip()
+                    if not stripped:
+                        continue
+                    total_lines += 1
+
+                    try:
+                        data = json.loads(stripped)
+                    except (json.JSONDecodeError, RecursionError, MemoryError):
+                        logger.warning(
+                            "Corrupt line {} in session {} at {} — skipping",
+                            line_num, key, path,
+                        )
+                        skipped_count += 1
+                        # Check if this skip is before the consolidation boundary.
+                        # Only corrupt MESSAGE lines (parse failures) can cause index shifts.
+                        # Non-dict values are not messages and don't occupy message slots.
+                        if metadata_parsed and msg_index < last_consolidated:
+                            skipped_before_boundary = True
                         continue
 
-                    data = json.loads(line)
+                    if not isinstance(data, dict):
+                        logger.warning(
+                            "Non-dict JSON on line {} in session {} at {} — skipping",
+                            line_num, key, path,
+                        )
+                        skipped_count += 1
+                        # Non-dict values were never messages — no index shift.
+                        # Do NOT set skipped_before_boundary.
+                        continue
 
                     if data.get("_type") == "metadata":
-                        metadata = data.get("metadata", {})
-                        created_at = datetime.fromisoformat(data["created_at"]) if data.get("created_at") else None
-                        last_consolidated = data.get("last_consolidated", 0)
+                        # Parse metadata fields individually with safe defaults
+                        raw_meta = data.get("metadata", {})
+                        if not isinstance(raw_meta, dict):
+                            logger.warning("Non-dict metadata in session {} at {}", key, path)
+                            raw_meta = {}
+                        metadata = raw_meta
+
+                        try:
+                            created_at = (
+                                datetime.fromisoformat(data["created_at"])
+                                if data.get("created_at")
+                                else None
+                            )
+                        except (ValueError, TypeError):
+                            logger.warning("Invalid created_at in session {} at {}", key, path)
+
+                        if "last_consolidated" not in data:
+                            last_consolidated_untrustworthy = True
+                        else:
+                            try:
+                                last_consolidated = int(data["last_consolidated"])
+                            except (ValueError, TypeError, OverflowError):
+                                logger.warning(
+                                    "Invalid last_consolidated in session {} at {}, falling back to len(messages)",
+                                    key, path,
+                                )
+                                last_consolidated_untrustworthy = True
+
+                        metadata_parsed = True
+                        recovered = True
                     else:
                         messages.append(data)
+                        msg_index += 1
+                        recovered = True
+
+            if not recovered:
+                return None
+
+            # Consolidation safety: when last_consolidated is untrustworthy,
+            # metadata line missing, or a corrupt line was skipped before the
+            # consolidation boundary (index-shift protection), assume all loaded
+            # messages are already consolidated.
+            # No `and messages` guard — when messages is empty, len(messages)=0
+            # is the correct fallback (prevents high lc from making new messages invisible).
+            if last_consolidated_untrustworthy or not metadata_parsed or skipped_before_boundary:
+                last_consolidated = len(messages)
+                logger.warning(
+                    "Consolidation boundary uncertain in session {} (skipped={}, "
+                    "untrusted={}, no_metadata={}) — assuming all {} loaded messages "
+                    "are consolidated",
+                    key, skipped_count, last_consolidated_untrustworthy,
+                    not metadata_parsed, len(messages),
+                )
+
+            # Lower-bound clamping for negative values.
+            # Upper-bound clamp intentionally omitted: all consumers (get_history(),
+            # pick_consolidation_boundary, retain_recent_legal_suffix) handle
+            # last_consolidated > len(messages) correctly via Python slice semantics.
+            if last_consolidated < 0:
+                logger.warning(
+                    "Negative last_consolidated ({}) in session {} — clamping to 0",
+                    last_consolidated, key,
+                )
+                last_consolidated = 0
+
+            if skipped_count > 0:
+                logger.info(
+                    "Session {} partially recovered: {}/{} lines loaded, {} skipped (excludes duplicate metadata)",
+                    key, len(messages) + (1 if metadata_parsed else 0), total_lines, skipped_count,
+                )
 
             return Session(
                 key=key,
                 messages=messages,
                 created_at=created_at or datetime.now(),
                 metadata=metadata,
-                last_consolidated=last_consolidated
+                last_consolidated=last_consolidated,
             )
-        except Exception as e:
-            logger.warning("Failed to load session {}: {}", key, e)
+        except (OSError, UnicodeDecodeError) as e:
+            # Outer catch: I/O failures and encoding errors that prevent
+            # reading the file at all. All parse errors are handled per-line above.
+            logger.warning("Failed to load session {} at {}: {}", key, path, e)
             return None
 
     def save(self, session: Session) -> None:
