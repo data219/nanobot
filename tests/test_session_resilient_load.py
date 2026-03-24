@@ -3,6 +3,7 @@
 import json
 from datetime import datetime
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -480,30 +481,16 @@ class TestValidFileRoundtrip:
 
 
 class TestOSErrorCatch:
-    def test_load_permission_error_returns_none(
-        self, tmp_session_manager: SessionManager, tmp_path
-    ):
+    def test_load_permission_error_returns_none(self, tmp_session_manager: SessionManager):
         """OSError (e.g. PermissionError) on open → returns None."""
         path = tmp_session_manager._get_session_path("telegram:12345")
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(_make_metadata_line() + "\n", encoding="utf-8")
-        # Remove read permission
-        path.chmod(0o000)
 
-        try:
+        with patch("builtins.open", side_effect=PermissionError("denied")):
             session = tmp_session_manager._load("telegram:12345")
-        finally:
-            path.chmod(0o644)  # restore for cleanup
 
-        # On systems where root ignores permissions (e.g. Docker), this may not fail.
-        # Only assert None if we're not root.
-        import os
-
-        if os.geteuid() != 0:
-            assert session is None
-        else:
-            # Root can read anything — at least verify it loads without error
-            assert session is not None
+        assert session is None
 
 
 class TestDuplicateMetadata:
@@ -583,3 +570,67 @@ class TestAllNonDictFile:
         session = tmp_session_manager._load("telegram:12345")
 
         assert session is None
+
+
+class TestErrorsReplaceBehavior:
+    def test_load_utf8_garbled_line_parses_as_valid_json_with_replacement_char(
+        self, tmp_session_manager: SessionManager
+    ):
+        """Mid-content UTF-8 truncation with intact JSON structure: message loads with U+FFFD."""
+        path = tmp_session_manager._get_session_path("telegram:12345")
+        # Truncated é (0xc3 without 0xa9) inside a valid JSON structure
+        data = (
+            _make_metadata_line().encode("utf-8")
+            + b"\n"
+            + b'{"role":"user","content":"caf\xc3"}'
+            + b"\n"
+            + _make_message_line("assistant", "ok").encode("utf-8")
+        )
+        _write_session_file_bytes(path, data)
+
+        session = tmp_session_manager._load("telegram:12345")
+
+        assert session is not None
+        assert len(session.messages) == 2
+        assert "\ufffd" in session.messages[0]["content"]  # garbled but recovered
+
+
+class TestLastConsolidatedFloatTruncation:
+    def test_load_float_last_consolidated_truncated(self, tmp_session_manager: SessionManager):
+        """Non-integer float last_consolidated (3.7) is truncated to 3, not rounded."""
+        path = tmp_session_manager._get_session_path("telegram:12345")
+        raw_metadata = (
+            '{"_type":"metadata","key":"telegram:12345",'
+            '"created_at":"2026-03-23T10:00:00","updated_at":"2026-03-23T22:00:00",'
+            '"metadata":{},"last_consolidated":3.7}'
+        )
+        lines = [raw_metadata, _make_message_line("user", "m0"), _make_message_line("user", "m1")]
+        _write_session_file(path, lines)
+
+        session = tmp_session_manager._load("telegram:12345")
+
+        assert session is not None
+        assert session.last_consolidated == 3  # truncated, not rounded
+
+    def test_load_float_integer_last_consolidated_accepted(
+        self, tmp_session_manager: SessionManager
+    ):
+        """Integer-valued float last_consolidated (3.0) is accepted without warning."""
+        path = tmp_session_manager._get_session_path("telegram:12345")
+        raw_metadata = (
+            '{"_type":"metadata","key":"telegram:12345",'
+            '"created_at":"2026-03-23T10:00:00","updated_at":"2026-03-23T22:00:00",'
+            '"metadata":{},"last_consolidated":3.0}'
+        )
+        lines = [
+            raw_metadata,
+            _make_message_line("user", "m0"),
+            _make_message_line("user", "m1"),
+            _make_message_line("user", "m2"),
+        ]
+        _write_session_file(path, lines)
+
+        session = tmp_session_manager._load("telegram:12345")
+
+        assert session is not None
+        assert session.last_consolidated == 3

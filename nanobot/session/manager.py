@@ -187,14 +187,14 @@ class SessionManager:
             # Position-aware index-shift tracking:
             # If a corrupt line is skipped BEFORE the known consolidation boundary,
             # subsequent messages shift to lower indices, making the boundary unreliable.
-            # Accepted limitation: if metadata appears after messages (non-standard format
-            # not produced by save()), pre-metadata skips won't be caught by index-shift
-            # tracking, and `not metadata_parsed` won't trigger either (metadata was parsed,
-            # just late). This edge case is not covered — it requires a manually edited file
-            # with metadata moved after messages, which save() never produces.
+            # Note: metadata after messages or dual-metadata with intermediate corrupt
+            # lines (not produced by save()) defeats index-shift tracking.
             msg_index = 0
             skipped_before_boundary = False
 
+            # errors="replace" trades total session loss (pre-R10) for partial recovery.
+            # Tradeoff: garbled UTF-8 bytes become U+FFFD, which parses as valid JSON
+            # with corrupted content. This corruption persists across save/load cycles.
             with open(path, encoding="utf-8-sig", errors="replace") as f:
                 for line_num, raw in enumerate(f, 1):
                     stripped = raw.strip()
@@ -328,11 +328,10 @@ class SessionManager:
                 metadata=metadata,
                 last_consolidated=last_consolidated,
             )
-        except (OSError, UnicodeDecodeError) as e:
+        except OSError as e:
             # Outer catch: I/O failures that prevent reading the file at all.
-            # UnicodeDecodeError is a safety net — with errors="replace" on the open()
-            # call above, this should not be raised for mid-file corruption, but covers
-            # edge cases like filesystem-level encoding issues.
+            # With errors="replace" on the open() call, encoding errors are handled
+            # per-line as U+FFFD replacement — no UnicodeDecodeError escapes here.
             logger.warning("Failed to load session {} at {}: {}", key, path, e)
             return None
 
@@ -371,7 +370,7 @@ class SessionManager:
         for path in self.sessions_dir.glob("*.jsonl"):
             try:
                 # Read just the metadata line
-                with open(path, encoding="utf-8-sig") as f:
+                with open(path, encoding="utf-8-sig", errors="replace") as f:
                     first_line = f.readline().strip()
                     if first_line:
                         data = json.loads(first_line)
