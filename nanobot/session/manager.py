@@ -34,12 +34,7 @@ class Session:
 
     def add_message(self, role: str, content: str, **kwargs: Any) -> None:
         """Add a message to the session."""
-        msg = {
-            "role": role,
-            "content": content,
-            "timestamp": datetime.now().isoformat(),
-            **kwargs
-        }
+        msg = {"role": role, "content": content, "timestamp": datetime.now().isoformat(), **kwargs}
         self.messages.append(msg)
         self.updated_at = datetime.now()
 
@@ -59,7 +54,7 @@ class Session:
                 if tid and str(tid) not in declared:
                     start = i + 1
                     declared.clear()
-                    for prev in messages[start:i + 1]:
+                    for prev in messages[start : i + 1]:
                         if prev.get("role") == "assistant":
                             for tc in prev.get("tool_calls") or []:
                                 if isinstance(tc, dict) and tc.get("id"):
@@ -68,7 +63,7 @@ class Session:
 
     def get_history(self, max_messages: int = 500) -> list[dict[str, Any]]:
         """Return unconsolidated messages for LLM input, aligned to a legal tool-call boundary."""
-        unconsolidated = self.messages[self.last_consolidated:]
+        unconsolidated = self.messages[self.last_consolidated :]
         sliced = unconsolidated[-max_messages:]
 
         # Drop leading non-user messages to avoid starting mid-turn when possible.
@@ -215,7 +210,9 @@ class SessionManager:
                     except (json.JSONDecodeError, RecursionError, MemoryError):
                         logger.warning(
                             "Corrupt line {} in session {} at {} — skipping",
-                            line_num, key, path,
+                            line_num,
+                            key,
+                            path,
                         )
                         skipped_count += 1
                         # Check if this skip is before the consolidation boundary.
@@ -228,7 +225,9 @@ class SessionManager:
                     if not isinstance(data, dict):
                         logger.warning(
                             "Non-dict JSON on line {} in session {} at {} — skipping",
-                            line_num, key, path,
+                            line_num,
+                            key,
+                            path,
                         )
                         skipped_count += 1
                         # Non-dict values were never messages — no index shift.
@@ -260,7 +259,8 @@ class SessionManager:
                             except (ValueError, TypeError, OverflowError):
                                 logger.warning(
                                     "Invalid last_consolidated in session {} at {}, falling back to len(messages)",
-                                    key, path,
+                                    key,
+                                    path,
                                 )
                                 last_consolidated_untrustworthy = True
 
@@ -286,8 +286,11 @@ class SessionManager:
                     "Consolidation boundary uncertain in session {} (skipped={}, "
                     "untrusted={}, no_metadata={}) — assuming all {} loaded messages "
                     "are consolidated",
-                    key, skipped_count, last_consolidated_untrustworthy,
-                    not metadata_parsed, len(messages),
+                    key,
+                    skipped_count,
+                    last_consolidated_untrustworthy,
+                    not metadata_parsed,
+                    len(messages),
                 )
 
             # Lower-bound clamping for negative values.
@@ -297,14 +300,18 @@ class SessionManager:
             if last_consolidated < 0:
                 logger.warning(
                     "Negative last_consolidated ({}) in session {} — clamping to 0",
-                    last_consolidated, key,
+                    last_consolidated,
+                    key,
                 )
                 last_consolidated = 0
 
             if skipped_count > 0:
                 logger.info(
                     "Session {} partially recovered: {}/{} lines loaded, {} skipped (excludes duplicate metadata)",
-                    key, len(messages) + (1 if metadata_parsed else 0), total_lines, skipped_count,
+                    key,
+                    len(messages) + (1 if metadata_parsed else 0),
+                    total_lines,
+                    skipped_count,
                 )
 
             return Session(
@@ -331,7 +338,7 @@ class SessionManager:
                 "created_at": session.created_at.isoformat(),
                 "updated_at": session.updated_at.isoformat(),
                 "metadata": session.metadata,
-                "last_consolidated": session.last_consolidated
+                "last_consolidated": session.last_consolidated,
             }
             f.write(json.dumps(metadata_line, ensure_ascii=False) + "\n")
             for msg in session.messages:
@@ -361,12 +368,14 @@ class SessionManager:
                         data = json.loads(first_line)
                         if data.get("_type") == "metadata":
                             key = data.get("key") or path.stem.replace("_", ":", 1)
-                            sessions.append({
-                                "key": key,
-                                "created_at": data.get("created_at"),
-                                "updated_at": data.get("updated_at"),
-                                "path": str(path)
-                            })
+                            sessions.append(
+                                {
+                                    "key": key,
+                                    "created_at": data.get("created_at"),
+                                    "updated_at": data.get("updated_at"),
+                                    "path": str(path),
+                                }
+                            )
             except Exception:
                 continue
 
