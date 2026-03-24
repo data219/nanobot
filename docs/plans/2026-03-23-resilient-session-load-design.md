@@ -1,6 +1,6 @@
 # Design: Resilient Session Load
 
-**Datum:** 2026-03-24 (v9 — Plan-Review Runde 8 konsolidiert)
+**Datum:** 2026-03-24 (R10 — 6-Skill Code-Review-Runde)
 **Repo:** HKUDS/nanobot
 **Branch:** `fix/resilient-session-load`
 **Target:** `main` (Bug Fix, keine Verhaltensänderung für valide Dateien)
@@ -24,6 +24,48 @@
 | v7 | 5× | 12 dedup (1M, 7m, 2n, 2s) | → v8 |
 | v8 | 5× | 11 dedup (1M, 8m, 2n, 1s) | → v9 |
 | v9 | — | — | **PROCEED** |
+| R10 | 6× | ~35 → 24 dedup (5M, 12m, 3d, 4n) | **WARN → FIX** |
+
+### v9 → R10 Änderungen (Code-Review-Runde, 6 Skills)
+
+**6 Reviewer:** skeptic-coding, skeptic-architecture, skeptic-security, skeptic-complexity, code-review-master, code-review-excellence
+
+**In-Scope Fixes (10):**
+- **MAJOR M1:** `errors="replace"` auf file open — mid-file UTF-8 Korruption recovered jetzt partial statt Session komplett zu verwerfen
+- **m1:** Falscher Kommentar über non-standard metadata fallback korrigiert (behauptete Abdeckung die nicht existiert)
+- **m2:** `list_sessions()` encoding `utf-8` → `utf-8-sig` (BOM-Files waren unsichtbar)
+- **m3:** Dead re-scan loop in `_find_legal_start` entfernt (6 Zeilen toter Code)
+- **m4:** Ghost-Referenz `pick_consolidation_boundary` im Kommentar entfernt
+- **m5:** Float-to-int truncation bei `last_consolidated` jetzt mit Warning-Log
+- **m11:** Test-Docstring "v9" Version-Referenz entfernt
+- **m12:** Test-Name `overflow_clamped` → `overflow_fallback` (akkurater)
+- **Nitpick:** MemoryError-catch Rationale als Kommentar hinzugefügt
+- **Nitpick:** UnicodeDecodeError outer-catch als Safety-Net kommentiert
+
+**Neue Tests (5):**
+- OSError catch path (PermissionError)
+- Duplicate metadata lines (untrustworthy sticky flag)
+- RecursionError + index-shift interaction
+- Corrupt line at exact consolidation boundary
+- All-non-dict file returns None
+
+**Test count:** 28 (was 23)
+
+**Out-of-Scope (3 MAJOR, 7 Minor/Nitpick — separat zu adressieren):**
+- File locking / TOCTOU race (upstream PR #1027)
+- Atomic save (upstream PR #1027)
+- Symlink validation (separater PR)
+- Resource limits / unbounded memory (separater PR)
+- Non-atomic legacy migration (pre-existing)
+- Null bytes in safe_filename (helpers.py)
+- Info leakage in logs (debatable)
+- Cache no expiry (pre-existing)
+- No-upper-clamp truncation (intentional design, documented+tested)
+
+**Design Decisions (akzeptiert):**
+- No-upper-clamp: absichtlich, korrekt über Slice-Semantics
+- skipped_before_boundary Komplexität: 25 Zeilen für rare path, aber korrekt
+- LLM temporär blind nach Fallback: sicheres Verhalten
 
 ### v7 → v8 Änderungen (12 Findings adressiert)
 - **MAJOR:** `skipped_before_boundary` Check aus non-dict Branch entfernt — non-dict JSON Werte waren nie Messages und belegen keinen Message-Slot, verursachen also keinen Index-Shift
