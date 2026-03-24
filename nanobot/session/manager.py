@@ -54,11 +54,6 @@ class Session:
                 if tid and str(tid) not in declared:
                     start = i + 1
                     declared.clear()
-                    for prev in messages[start : i + 1]:
-                        if prev.get("role") == "assistant":
-                            for tc in prev.get("tool_calls") or []:
-                                if isinstance(tc, dict) and tc.get("id"):
-                                    declared.add(str(tc["id"]))
         return start
 
     def get_history(self, max_messages: int = 500) -> list[dict[str, Any]]:
@@ -192,13 +187,15 @@ class SessionManager:
             # Position-aware index-shift tracking:
             # If a corrupt line is skipped BEFORE the known consolidation boundary,
             # subsequent messages shift to lower indices, making the boundary unreliable.
-            # Known limitation: if metadata appears after messages (non-standard format
-            # not produced by save()), pre-metadata skips won't be caught here.
-            # The fallback via `not metadata_parsed` still covers that extreme case.
+            # Accepted limitation: if metadata appears after messages (non-standard format
+            # not produced by save()), pre-metadata skips won't be caught by index-shift
+            # tracking, and `not metadata_parsed` won't trigger either (metadata was parsed,
+            # just late). This edge case is not covered — it requires a manually edited file
+            # with metadata moved after messages, which save() never produces.
             msg_index = 0
             skipped_before_boundary = False
 
-            with open(path, encoding="utf-8-sig") as f:
+            with open(path, encoding="utf-8-sig", errors="replace") as f:
                 for line_num, raw in enumerate(f, 1):
                     stripped = raw.strip()
                     if not stripped:
@@ -208,6 +205,8 @@ class SessionManager:
                     try:
                         data = json.loads(stripped)
                     except (json.JSONDecodeError, RecursionError, MemoryError):
+                        # MemoryError: catches JSON payloads so large they exhaust memory
+                        # during parsing. Better to skip one line than lose the entire session.
                         logger.warning(
                             "Corrupt line {} in session {} at {} — skipping",
                             line_num,
@@ -255,7 +254,15 @@ class SessionManager:
                             last_consolidated_untrustworthy = True
                         else:
                             try:
-                                last_consolidated = int(data["last_consolidated"])
+                                lc_raw = data["last_consolidated"]
+                                if isinstance(lc_raw, float) and not lc_raw.is_integer():
+                                    logger.warning(
+                                        "Non-integer last_consolidated ({}) in session {} at {} — truncating",
+                                        lc_raw,
+                                        key,
+                                        path,
+                                    )
+                                last_consolidated = int(lc_raw)
                             except (ValueError, TypeError, OverflowError):
                                 logger.warning(
                                     "Invalid last_consolidated in session {} at {}, falling back to len(messages)",
@@ -295,8 +302,8 @@ class SessionManager:
 
             # Lower-bound clamping for negative values.
             # Upper-bound clamp intentionally omitted: all consumers (get_history(),
-            # pick_consolidation_boundary, retain_recent_legal_suffix) handle
-            # last_consolidated > len(messages) correctly via Python slice semantics.
+            # retain_recent_legal_suffix) handle last_consolidated > len(messages)
+            # correctly via Python slice semantics.
             if last_consolidated < 0:
                 logger.warning(
                     "Negative last_consolidated ({}) in session {} — clamping to 0",
@@ -322,8 +329,10 @@ class SessionManager:
                 last_consolidated=last_consolidated,
             )
         except (OSError, UnicodeDecodeError) as e:
-            # Outer catch: I/O failures and encoding errors that prevent
-            # reading the file at all. All parse errors are handled per-line above.
+            # Outer catch: I/O failures that prevent reading the file at all.
+            # UnicodeDecodeError is a safety net — with errors="replace" on the open()
+            # call above, this should not be raised for mid-file corruption, but covers
+            # edge cases like filesystem-level encoding issues.
             logger.warning("Failed to load session {} at {}: {}", key, path, e)
             return None
 
@@ -362,7 +371,7 @@ class SessionManager:
         for path in self.sessions_dir.glob("*.jsonl"):
             try:
                 # Read just the metadata line
-                with open(path, encoding="utf-8") as f:
+                with open(path, encoding="utf-8-sig") as f:
                     first_line = f.readline().strip()
                     if first_line:
                         data = json.loads(first_line)

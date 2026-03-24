@@ -170,16 +170,27 @@ class TestCorruptMessageLines:
         assert session.messages[0]["content"] == "before"
         assert session.messages[1]["content"] == "after"
 
-    def test_load_unicode_decode_error_returns_none(self, tmp_session_manager: SessionManager):
-        """Truncation mid-multi-byte UTF-8 → UnicodeDecodeError caught → None."""
+    def test_load_unicode_decode_error_mid_file_recovers(self, tmp_session_manager: SessionManager):
+        """Truncation mid-multi-byte UTF-8 mid-file: garbled line skipped, surrounding data recovered."""
         path = tmp_session_manager._get_session_path("telegram:12345")
-        # Write bytes: valid metadata line + truncated line mid-é (0xc3 without 0xa9)
-        data = _make_metadata_line().encode("utf-8") + b"\n" + b'{"role":"user","content":"caf\xc3'
+        # Write bytes: valid metadata + valid msg + truncated mid-é (0xc3 without 0xa9) + valid msg
+        data = (
+            _make_metadata_line().encode("utf-8")
+            + b"\n"
+            + _make_message_line("user", "before").encode("utf-8")
+            + b"\n"
+            + b'{"role":"user","content":"caf\xc3'
+            + b"\n"
+            + _make_message_line("assistant", "after").encode("utf-8")
+        )
         _write_session_file_bytes(path, data)
 
         session = tmp_session_manager._load("telegram:12345")
 
-        assert session is None
+        assert session is not None
+        assert len(session.messages) == 2
+        assert session.messages[0]["content"] == "before"
+        assert session.messages[1]["content"] == "after"
 
 
 class TestCorruptMetadata:
@@ -296,7 +307,7 @@ class TestLastConsolidatedBounds:
         assert session.last_consolidated == 0
         assert len(session.messages) == 1
 
-    def test_load_overflow_last_consolidated_clamped(self, tmp_session_manager: SessionManager):
+    def test_load_overflow_last_consolidated_fallback(self, tmp_session_manager: SessionManager):
         """JSON float 1e999 triggers OverflowError on int() → fallback to len(messages)."""
         path = tmp_session_manager._get_session_path("telegram:12345")
         # 1e999 → json.loads → float('inf') → int(float('inf')) → OverflowError
@@ -405,9 +416,8 @@ class TestFallbackWithEmptyMessages:
         self, tmp_session_manager: SessionManager
     ):
         """Metadata says lc=100 but all message lines are corrupt → lc corrected to 0.
-        Regression test: the `and messages` guard was removed in v9 because it prevented
-        the fallback when messages is empty, leaving a high lc that would make new user
-        messages invisible to the LLM."""
+        Regression: when messages is empty, the fallback must still set lc=len(messages)
+        to prevent a high lc from making new user messages invisible to the LLM."""
         path = tmp_session_manager._get_session_path("telegram:12345")
         lines = [
             _make_metadata_line(last_consolidated=100),
@@ -421,7 +431,7 @@ class TestFallbackWithEmptyMessages:
         assert session is not None
         assert session.messages == []
         # Both corrupt lines parse-fail at msg_index=0 < lc=100 → skipped_before_boundary=True.
-        # With `and messages` guard removed: fallback sets lc = len([]) = 0.
+        # Fallback sets lc = len([]) = 0 (no `and messages` guard).
         assert session.last_consolidated == 0
 
 
@@ -467,3 +477,109 @@ class TestValidFileRoundtrip:
         assert loaded.metadata == {"lang": "en"}
         assert loaded.last_consolidated == 7
         assert loaded.created_at == fixed_time
+
+
+class TestOSErrorCatch:
+    def test_load_permission_error_returns_none(
+        self, tmp_session_manager: SessionManager, tmp_path
+    ):
+        """OSError (e.g. PermissionError) on open → returns None."""
+        path = tmp_session_manager._get_session_path("telegram:12345")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(_make_metadata_line() + "\n", encoding="utf-8")
+        # Remove read permission
+        path.chmod(0o000)
+
+        try:
+            session = tmp_session_manager._load("telegram:12345")
+        finally:
+            path.chmod(0o644)  # restore for cleanup
+
+        # On systems where root ignores permissions (e.g. Docker), this may not fail.
+        # Only assert None if we're not root.
+        import os
+
+        if os.geteuid() != 0:
+            assert session is None
+        else:
+            # Root can read anything — at least verify it loads without error
+            assert session is not None
+
+
+class TestDuplicateMetadata:
+    def test_load_duplicate_metadata_last_wins(self, tmp_session_manager: SessionManager):
+        """Two metadata lines: second overwrites first, untrustworthy flag is sticky."""
+        path = tmp_session_manager._get_session_path("telegram:12345")
+        lines = [
+            _make_metadata_line(last_consolidated="invalid"),
+            _make_message_line("user", "msg0"),
+            _make_metadata_line(last_consolidated=1),
+            _make_message_line("user", "msg1"),
+        ]
+        _write_session_file(path, lines)
+
+        session = tmp_session_manager._load("telegram:12345")
+
+        assert session is not None
+        assert len(session.messages) == 2
+        # First metadata sets untrustworthy=True (sticky), second metadata parsed but
+        # untrustworthy was never reset → fallback triggers
+        assert session.last_consolidated == 2  # len(messages)
+
+
+class TestRecursionErrorIndexShift:
+    def test_load_recursion_error_before_boundary_triggers_fallback(
+        self, tmp_session_manager: SessionManager
+    ):
+        """RecursionError (deeply nested JSON) before consolidation boundary → index-shift protection."""
+        path = tmp_session_manager._get_session_path("telegram:12345")
+        deep_json = '{"a":' * 50000 + '"b"' + "}" * 50000
+        lines = [
+            _make_metadata_line(last_consolidated=2),
+            _make_message_line("user", "msg0"),  # index 0
+            deep_json,  # RecursionError at index 1, BEFORE boundary (lc=2)
+            _make_message_line("user", "msg2"),  # index 2 (shifted)
+        ]
+        _write_session_file(path, lines)
+
+        session = tmp_session_manager._load("telegram:12345")
+
+        assert session is not None
+        assert len(session.messages) == 2
+        # skipped_before_boundary=True → fallback: last_consolidated = len(messages)
+        assert session.last_consolidated == 2
+
+
+class TestCorruptLineAtBoundary:
+    def test_load_corrupt_line_at_exact_boundary_no_fallback(
+        self, tmp_session_manager: SessionManager
+    ):
+        """Corrupt line at exactly msg_index == last_consolidated: no fallback triggered."""
+        path = tmp_session_manager._get_session_path("telegram:12345")
+        lines = [
+            _make_metadata_line(last_consolidated=2),
+            _make_message_line("user", "msg0"),  # index 0 — consolidated
+            _make_message_line("user", "msg1"),  # index 1 — consolidated
+            "CORRUPT{{{",  # index 2 == lc — first unconsolidated, NOT before boundary
+            _make_message_line("user", "msg3"),  # index 3 — unconsolidated
+        ]
+        _write_session_file(path, lines)
+
+        session = tmp_session_manager._load("telegram:12345")
+
+        assert session is not None
+        assert len(session.messages) == 3
+        # msg_index=2, lc=2 → 2 < 2 is False → skipped_before_boundary stays False
+        assert session.last_consolidated == 2
+
+
+class TestAllNonDictFile:
+    def test_load_all_non_dict_returns_none(self, tmp_session_manager: SessionManager):
+        """File with only non-dict JSON values (strings): recovered=False → None."""
+        path = tmp_session_manager._get_session_path("telegram:12345")
+        lines = ['"hello"', '"world"', '"test"']
+        _write_session_file(path, lines)
+
+        session = tmp_session_manager._load("telegram:12345")
+
+        assert session is None
