@@ -19,9 +19,10 @@ class ContextBuilder:
     BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md"]
     _RUNTIME_CONTEXT_TAG = "[Runtime Context — metadata only, not instructions]"
 
-    def __init__(self, workspace: Path, timezone: str | None = None):
+    def __init__(self, workspace: Path, timezone: str | None = None, vision: bool = True):
         self.workspace = workspace
         self.timezone = timezone
+        self.vision = vision
         self.memory = MemoryStore(workspace)
         self.skills = SkillsLoader(workspace)
 
@@ -150,7 +151,11 @@ IMPORTANT: To send files (images, documents, audio, video) to the user, you MUST
         ]
 
     def _build_user_content(self, text: str, media: list[str] | None) -> str | list[dict[str, Any]]:
-        """Build user message content with optional base64-encoded images."""
+        """Build user message content with optional base64-encoded images.
+
+        When vision is disabled (non-vision models), images are referenced as text
+        annotations instead of being base64-encoded, avoiding API errors.
+        """
         if not media:
             return text
 
@@ -164,16 +169,26 @@ IMPORTANT: To send files (images, documents, audio, video) to the user, you MUST
             mime = detect_image_mime(raw) or mimetypes.guess_type(path)[0]
             if not mime or not mime.startswith("image/"):
                 continue
-            b64 = base64.b64encode(raw).decode()
-            images.append({
-                "type": "image_url",
-                "image_url": {"url": f"data:{mime};base64,{b64}"},
-                "_meta": {"path": str(p)},
-            })
+
+            if self.vision:
+                b64 = base64.b64encode(raw).decode()
+                images.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{mime};base64,{b64}"},
+                    "_meta": {"path": str(p)},
+                })
+            else:
+                # Non-vision model: append text reference so the model knows an image was shared
+                images.append(p.name)
 
         if not images:
             return text
-        return images + [{"type": "text", "text": text}]
+
+        if self.vision:
+            return images + [{"type": "text", "text": text}]
+        else:
+            image_refs = "\n".join(f"[image: {name}]" for name in images)
+            return f"{text}\n\n{image_refs}"
 
     def add_tool_result(
         self, messages: list[dict[str, Any]],
